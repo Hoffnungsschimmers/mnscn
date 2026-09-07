@@ -12,6 +12,7 @@ import re
 import json
 import sys
 import base64
+from urllib.parse import unquote
 import requests
 from pathlib import Path
 
@@ -23,8 +24,13 @@ SUPPORTED_SCHEMES = [
     "ss://", "ssr://", "hysteria2://", "hy2://", "tuic://",
 ]
 
+# 匹配到行尾，因为 # 之后的节点别名可能含空格，而别名里带着地区信息
 RE_NODE_LINK = re.compile(
-    r"(?:vless|vmess|trojan|ss|ssr|hysteria2|hy2|tuic)://[^\s#]+"
+    r"(?:vless|vmess|trojan|ss|ssr|hysteria2|hy2|tuic)://[^\r\n]+"
+)
+RE_REGION = re.compile(
+    r"(香港|澳门|台湾|日本|韩国|新加坡|美国|英国|德国|法国|荷兰|俄罗斯|印度|土耳其|加拿大|澳大利亚|巴西|越南|泰国|马来西亚)"
+    r"|(?<![A-Za-z])(HK|MO|TW|JP|KR|SG|US|UK|GB|DE|FR|NL|RU|IN|TR|CA|AU|BR|VN|TH|MY)(?![A-Za-z])"
 )
 RE_IPV4 = re.compile(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(?::(\d{1,5}))?")
 RE_IPV6_BRACKET = re.compile(r"\[([0-9a-fA-F:]+)\]:(\d{1,5})")
@@ -32,6 +38,8 @@ RE_DOMAIN = re.compile(
     r"([a-zA-Z0-9][-a-zA-Z0-9.]*\.[a-zA-Z]{2,})(?::(\d{1,5}))?"
 )
 RE_HTML_TAG = re.compile(r"<[a-zA-Z/!]")
+# uuid@host:port，host 可以是 IPv4、域名或 [IPv6]
+RE_NODE_HOSTPORT = re.compile(r"[^@]+@(\[[0-9a-fA-F:]+\]|[^:/?#]+):(\d{1,5})")
 USER_AGENT = (
     "v2rayN/edgetunnel "
     "(https://github.com/cmliu/edgetunnel)"
@@ -72,14 +80,20 @@ def resolve_sub_url(url: str) -> str:
 
 
 def decode_subscription(text: str) -> str:
-    """解码订阅内容：已是明文链接则原样返回，否则尝试 base64 解码"""
+    """解码订阅内容：已是明文则原样返回，否则尝试 base64 解码"""
     t = text.strip()
     if not t:
         return ""
     if "://" in t:
         return t
     decoded = b64_decode_loose(t)
-    if decoded and "://" in decoded:
+    # 订阅体可能是 base64 包裹的节点链接，也可能是 base64 包裹的纯 IP:Port 列表，
+    # 后者解码后不含 "://"，因此不能只用 "://" 判断解码是否成功。
+    if decoded and (
+        "://" in decoded
+        or RE_IPV4.search(decoded)
+        or RE_IPV6_BRACKET.search(decoded)
+    ):
         return decoded
     return t
 
@@ -120,7 +134,9 @@ def detect_type(content: str) -> str:
     # 检查纯文本 IP:Port
     ip_lines = sum(
         1 for line in text.splitlines()
-        if RE_IPV4.match(line.strip()) or RE_DOMAIN.match(line.strip())
+        if RE_IPV4.match(line.strip())
+        or RE_IPV6_BRACKET.match(line.strip())
+        or RE_DOMAIN.match(line.strip())
     )
     if ip_lines >= 3:
         return "txt"
@@ -133,8 +149,19 @@ def detect_type(content: str) -> str:
 
 # ---------- 解析函数 ----------
 
-def extract_from_nodes(content: str) -> list[tuple[str, str]]:
-    """从订阅内容提取节点 IP:Port，返回 [(server, port), ...]"""
+def pick_region(text: str) -> str:
+    """从节点别名里挑出地区标记，取不到就返回空字符串"""
+    if not text:
+        return ""
+    name = unquote(text).strip()
+    m = RE_REGION.search(name)
+    if m:
+        return m.group(0).upper() if m.group(2) else m.group(0)
+    return ""
+
+
+def extract_from_nodes(content: str) -> list[tuple[str, str, str]]:
+    """从订阅内容提取节点，返回 [(server, port, remark), ...]"""
     text = decode_subscription(content)
     seen = set()
     results = []
@@ -146,20 +173,24 @@ def extract_from_nodes(content: str) -> list[tuple[str, str]]:
         payload = link[scheme_end + 3:]
 
         server, port = None, None
+        # #号后是节点别名，地区信息通常在这里
+        remark = pick_region(payload.split("#", 1)[1] if "#" in payload else "")
 
         if scheme == "vmess://":
-            decoded = b64_decode_loose(payload)
+            decoded = b64_decode_loose(payload.split("#", 1)[0])
             if not decoded:
                 continue
             try:
                 info = json.loads(decoded)
                 server = (info.get("add") or "").strip()
                 port = str(info.get("port") or "").strip()
+                if not remark:
+                    remark = pick_region(str(info.get("ps") or ""))
             except Exception:
                 continue
 
         elif scheme == "ssr://":
-            decoded = b64_decode_loose(payload)
+            decoded = b64_decode_loose(payload.split("#", 1)[0])
             if not decoded:
                 continue
             # ssr://server:port:protocol:method:obfs:base64pass/?params
@@ -174,17 +205,19 @@ def extract_from_nodes(content: str) -> list[tuple[str, str]]:
             # ss:// 可能是 ss://base64(method:pass@host:port)#name
             clean = payload.split("#")[0].split("?")[0]
             decoded = b64_decode_loose(clean)
-            if decoded and "@" in decoded:
-                hostport = decoded.rsplit("@", 1)[-1]
-                if ":" in hostport:
-                    idx = hostport.rfind(":")
-                    server = hostport[:idx]
-                    port = hostport[idx + 1:]
+            # SIP002 形式的 ss:// 主体是明文 host:port，不需要解码
+            hostport_src = decoded if (decoded and "@" in decoded) else clean
+            if "@" in hostport_src:
+                hostport = hostport_src.rsplit("@", 1)[-1]
+                m = RE_NODE_HOSTPORT.match("x@" + hostport)
+                if m:
+                    server = m.group(1)
+                    port = m.group(2)
 
         else:
             # vless / trojan / hysteria2 / hy2 / tuic: uuid@server:port?...
             clean = payload.split("#")[0]
-            m = re.match(r"[^@]+@([^:]+):(\d+)", clean)
+            m = RE_NODE_HOSTPORT.match(clean)
             if m:
                 server = m.group(1).strip()
                 port = m.group(2)
@@ -202,13 +235,14 @@ def extract_from_nodes(content: str) -> list[tuple[str, str]]:
         if key in seen:
             continue
         seen.add(key)
-        results.append((server, port))
+        results.append((server, port, remark))
 
     return results
 
 
-def extract_from_txt(content: str) -> list[tuple[str, str]]:
+def extract_from_txt(content: str) -> list[tuple[str, str, str]]:
     """从纯文本提取 IP:Port 列表"""
+    content = decode_subscription(content)
     seen = set()
     results = []
 
@@ -217,8 +251,10 @@ def extract_from_txt(content: str) -> list[tuple[str, str]]:
         if not line or line.startswith("#") or line.startswith("//"):
             continue
 
-        # 去掉 # 注释部分
-        body = line.split("#")[0].strip()
+        # #号后是已有备注（如 #JP），保留下来而不是丢弃
+        body, _, existing = line.partition("#")
+        body = body.strip()
+        remark = existing.strip()
         if not body:
             continue
 
@@ -249,12 +285,12 @@ def extract_from_txt(content: str) -> list[tuple[str, str]]:
         if key in seen:
             continue
         seen.add(key)
-        results.append((server, port))
+        results.append((server, port, remark))
 
     return results
 
 
-def extract_from_html(content: str) -> list[tuple[str, str]]:
+def extract_from_html(content: str) -> list[tuple[str, str, str]]:
     """从 HTML 页面中提取：先找内嵌节点，再递归抓取子链接"""
     # 1) 直接在 HTML 里找节点链接
     node_ips = extract_from_nodes(content)
@@ -286,7 +322,7 @@ def extract_from_html(content: str) -> list[tuple[str, str]]:
 
 # ---------- edgetunnel 门户自动探测 ----------
 
-def try_edgetunnel_endpoints(base_url: str) -> list[tuple[str, str]]:
+def try_edgetunnel_endpoints(base_url: str) -> list[tuple[str, str, str]]:
     """
     对 edgetunnel 类订阅器，自动尝试常见端点获取节点：
     /auto -> /sub?token=auto -> /sub?host=&uuid=
@@ -310,9 +346,9 @@ def try_edgetunnel_endpoints(base_url: str) -> list[tuple[str, str]]:
 
 # ---------- 输出 ----------
 
-def format_output(ips: list[tuple[str, str]]) -> list[str]:
-    """格式化为: IP:Port#自动提取"""
-    return [f"{s}:{p}#auto" for s, p in ips]
+def format_output(ips: list[tuple[str, str, str]]) -> list[str]:
+    """格式化为: IP:Port#备注（无备注时回落为 auto）"""
+    return [f"{s}:{p}#{r or 'auto'}" for s, p, r in ips]
 
 
 # ---------- 主流程 ----------
@@ -368,11 +404,11 @@ def main():
 
         # IP:Port 去重
         count = 0
-        for server, port in ips:
+        for server, port, remark in ips:
             key = f"{server}:{port}"
             if key not in seen:
                 seen.add(key)
-                all_ips.append((server, port))
+                all_ips.append((server, port, remark))
                 count += 1
         print(f"   提取 {len(ips)} 个，去重后新增 {count} 个")
 

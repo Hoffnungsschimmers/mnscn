@@ -12,4 +12,4 @@
 #      https://edgetunnel.example.com
 #
 # 在下方添加你的订阅源：
-https://sd.campus.ccwu.cc/sub?token=6de342f652384561ec2572cf5
+sub://sub.xdu.qzz.io

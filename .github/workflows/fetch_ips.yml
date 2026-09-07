@@ -2,9 +2,9 @@ name: Fetch Subscription IPs
 
 on:
   schedule:
-    # 每天北京时间 18:00 运行（UTC 10:00）
-    - cron: '0 10 * * *'
-  workflow_dispatch: # 支持手动触发
+    # 每 12 小时运行一次（UTC 02:00 和 14:00，即北京时间 10:00 和 22:00）
+    - cron: '0 2,14 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: write

@@ -1,6 +1,15 @@
-# 订阅链接列表（每行一个）
-# 支持 sub:// 和 https:// 格式，# 号开头的行为注释
-# 示例：
-# sub://sub.xdu.qzz.io
+# ========== 订阅源列表 ==========
+# 每行一个链接，# 号开头为注释
+#
+# 支持的格式：
+#   1. 订阅地址（返回 vless/vmess/trojan/ss/ssr/hysteria2/tuic 节点）
+#      https://example.com/sub?token=xxxx
+#   2. TXT 网址文件（返回纯文本 IP:Port 列表）
+#      https://raw.githubusercontent.com/xxx/ips.txt
+#   3. sub:// 协议（自动 base64 解码为真实 URL）
+#      sub://sub.xdu.qzz.io
+#   4. 订阅器门户（自动尝试 /auto、/sub?token=auto 等端点）
+#      https://edgetunnel.example.com
+#
+# 在下方添加你的订阅源：
 # https://sd.campus.ccwu.cc/sub?token=6de342f652384561ec2572cf5
-https://sd.campus.ccwu.cc/sub?token=6de342f652384561ec2572cf5

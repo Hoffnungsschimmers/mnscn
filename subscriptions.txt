@@ -1,0 +1,6 @@
+# 订阅链接列表（每行一个）
+# 支持 sub:// 和 https:// 格式，# 号开头的行为注释
+# 示例：
+# sub://sub.xdu.qzz.io
+# https://sd.campus.ccwu.cc/sub?token=6de342f652384561ec2572cf5
+https://sd.campus.ccwu.cc/sub?token=6de342f652384561ec2572cf5
